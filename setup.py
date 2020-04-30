@@ -4,7 +4,7 @@ from setuptools import setup
 
 
 setup(
-    name="txwebtuils",
+    name="txwebutils",
     version="0.0.1",
     author="bennr01",
     author_email="benjamin99.vogt@web.de",
