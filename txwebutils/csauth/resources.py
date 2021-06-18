@@ -67,14 +67,32 @@ class WebLoginResource(Resource):
     @type token: L{six.text_type}
     @param secret: the secret matching the token
     @type secret: L{str}
+    @param request_dispatcher: object to use for making requests. This is used for testing. Defaults to the treq module.
+    @type request_dispatcher: any object with a L{treq}-like API
     """
     isLeaf = True
     
-    def __init__(self, auth_url, token=None, secret=None):
+    def __init__(self, auth_url, token=None, secret=None, request_dispatcher=None):
         Resource.__init__(self)
         self._auth_url = auth_url
         self._token = token
         self._secret = secret
+        self._set_request_dispatcher(request_dispatcher)
+    
+    
+    def _set_request_dispatcher(self, request_dispatcher):
+        """
+        Set the object to use for dispatching requests.
+        This is only meant for tests, but maybe you need it for something different?
+        
+        @param request_dispatcher: object to use for making requests. Defaults to the treq module.
+        @type request_dispatcher: any object with a L{treq}-like API or L{None}
+        """
+        if request_dispatcher is not None:
+            self._request_dispatcher = request_dispatcher
+        else:
+            self._request_dispatcher = treq
+        
     
     def on_login(self, request, userdata):
         """
@@ -99,7 +117,7 @@ class WebLoginResource(Resource):
         if action == u"login":
             # client wants to login
             # first of, prepare request
-            r = yield treq.post(
+            r = yield self._request_dispatcher.post(
                 self._auth_url,
                 params={
                     u"action": u"prepare",
@@ -141,7 +159,7 @@ class WebLoginResource(Resource):
         elif action == u"callback":
             # client is back from auth server
             ctoken = params.get(u"ctoken", [None])[0]
-            r = yield treq.get(
+            r = yield self._request_dispatcher.get(
                 self._auth_url,
                 params={
                     u"action": u"validate",

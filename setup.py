@@ -33,7 +33,7 @@ setup(
         "six",
         "Twisted",
         "zope.interface",
-        "treq",
+        "treq ~= 21.5.0",
         "expiringdict",
         ],
     )

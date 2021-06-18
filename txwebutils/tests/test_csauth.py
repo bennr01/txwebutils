@@ -3,15 +3,12 @@ Tests for L{txwebutils.csauth}.
 """
 import six
 from six.moves.urllib.parse import urlparse, parse_qs
-from twisted.internet import defer, reactor
-from twisted.internet.tcp import Client
-from twisted.internet.endpoints import TCP4ServerEndpoint
+from twisted.internet import defer
 from twisted.web.resource import Resource
-from twisted.web.server import Site
+from twisted.web.vhost import NameVirtualHost
 from twisted.cred import portal
 from twisted.trial import unittest
-import treq
-from treq._utils import get_global_pool, set_global_pool
+from treq.testing import StubTreq
 from zope.interface import implementer
 
 
@@ -122,13 +119,35 @@ class TestLoginResource(WebLoginResource):
         return userdata["username"]
 
 
+class DebugResource(Resource):
+    """
+    A simple resource printing important information if self.DEBUG = True.
+    You can pass a name to the constructor to easier identify it.
+    """
+    DEBUG = False
+    
+    def __init__(self, name="DebugResource"):
+        Resource.__init__(self)
+        self.name = name
+    
+    def getChild(self, name, request):
+        if self.DEBUG:
+            print("{}.getChild: ".format(self.name), name, request)
+            print("  Children: ", self.listNames())
+            print("  Headers: ", request.requestHeaders)
+        child = Resource.getChild(self, name, request)
+        if self.DEBUG:
+            print("{}.getChild -> ".format(self.name), child)
+        return child
+
+
 class CsauthTests(unittest.TestCase):
     """
     Tests for L{txwebutils.csauth}.
     """
-    WEB_SERVER_PORT     = 8080
-    AUTH_SERVER_PORT    = 8081
-    
+    WEB_NAME     = u"web.localhost"
+    AUTH_NAME    = u"auth.localhost"
+        
     SITE_A_NAME   = u"Site Alpha"
     SITE_A_TOKEN  = u"site a token"
     SITE_A_SECRET = u"secret for a"
@@ -141,7 +160,6 @@ class CsauthTests(unittest.TestCase):
     USER_B_NAME   = u"IAmUserB"
     USER_B_PSWD   = u"P-S-W-D_B"
     
-    @defer.inlineCallbacks
     def setUp(self):
         # prepare the authentication systems
         self.userdb = cred.InMemoryUnicodeUsernamePasswordDatabase()
@@ -162,7 +180,7 @@ class CsauthTests(unittest.TestCase):
             self.SITE_A_TOKEN,
             TestWebAuthPermission(
                 self.SITE_A_NAME,
-                "http://localhost:{}/login".format(self.WEB_SERVER_PORT),
+                "http://{}/login".format(self.WEB_NAME),
                 full_username=True,
                 ),
             )
@@ -174,7 +192,7 @@ class CsauthTests(unittest.TestCase):
             self.SITE_B_TOKEN,
             TestWebAuthPermission(
                 self.SITE_B_NAME,
-                "http://localhost:{}/bpage".format(self.WEB_SERVER_PORT),
+                "http://{}/bpage".format(self.WEB_NAME),
                 full_username=False,
                 ),
             )
@@ -195,22 +213,18 @@ class CsauthTests(unittest.TestCase):
             self.siteportal,
             self.userportal,
             lr,
-            url=u"http://localhost:{}/auth".format(self.AUTH_SERVER_PORT),
+            url=u"http://{}/auth".format(self.AUTH_NAME),
             )
-        arr = Resource()
+        arr = DebugResource("auth")
         arr.putChild(b"auth", authpage)
         arr.putChild(b"expire", SessionExpiringResource())
-        self.auth_site = Site(arr)
-        self.auth_site.displayTracebacks = True
         
         # prepare the web site
-        lrr = Resource()
-        self.web_site = Site(lrr)
-        self.web_site.displayTracebacks = True
+        lrr = DebugResource("web")
         
         # add the login page
         loginpage = TestLoginResource(
-            u"http://localhost:{}/auth".format(self.AUTH_SERVER_PORT),
+            u"http://{}/auth".format(self.AUTH_NAME),
             self.SITE_A_TOKEN,
             self.SITE_A_SECRET,
             )
@@ -218,7 +232,7 @@ class CsauthTests(unittest.TestCase):
         
         # add a login page with a different permission
         bpage = TestLoginResource(
-            u"http://localhost:{}/auth".format(self.AUTH_SERVER_PORT),
+            u"http://{}/auth".format(self.AUTH_NAME),
             self.SITE_B_TOKEN,
             self.SITE_B_SECRET,
             )
@@ -226,47 +240,22 @@ class CsauthTests(unittest.TestCase):
         
         # add a resource with an invalid token/secret combination
         invalidepage = TestLoginResource(
-            u"http://localhost:{}/auth".format(self.AUTH_SERVER_PORT),
+            u"http://{}/auth".format(self.AUTH_NAME),
             self.SITE_A_TOKEN,
             self.SITE_B_SECRET,  # <- site B secret
             )
         lrr.putChild(b"invalid", invalidepage)
         
-        # serve
-        self.auth_site_ep = TCP4ServerEndpoint(
-            reactor,
-            self.AUTH_SERVER_PORT,
-            interface=b"localhost",
-        )
-        self.web_site_ep = TCP4ServerEndpoint(
-            reactor,
-            self.WEB_SERVER_PORT,
-            interface=b"localhost",
-        )
-        self.auth_site_port = yield self.auth_site_ep.listen(self.auth_site)
-        self.web_site_port  = yield self.web_site_ep.listen(self.web_site)
-    
-    @defer.inlineCallbacks
-    def tearDown(self):
-        # close server endpoints
-        yield self.auth_site_port.stopListening()
-        yield self.web_site_port.stopListening()
+        # create and install treq stubs
+        supersite = NameVirtualHost()
+        supersite.addHost(self.AUTH_NAME.encode("ascii"), arr)
+        supersite.addHost(self.WEB_NAME.encode("ascii"), lrr)
+        supersite.default = DebugResource("default")
         
-        # close pool
-        pool = get_global_pool()
-        yield pool.closeCachedConnections()
-        while True:
-            fds = set(reactor.getReaders() + reactor.getReaders())
-            if not [fd for fd in fds if isinstance(fd, Client)]:
-                break
-            else:
-                d = defer.Deferred()
-                reactor.callLater(0, d.callback, None)
-                yield d
-        
-        # expire all sessions
-        for sid in list(self.auth_site.sessions.keys()):
-            self.auth_site.sessions[sid].expire()
+        self.treq = StubTreq(supersite)
+        loginpage._set_request_dispatcher(self.treq)
+        bpage._set_request_dispatcher(self.treq)
+        invalidepage._set_request_dispatcher(self.treq)
     
     @defer.inlineCallbacks
     def test_login_correct(self):
@@ -274,21 +263,21 @@ class CsauthTests(unittest.TestCase):
         Test a correct login.
         """
         # first, GET loginpage
-        r = yield treq.get(
-            u"http://localhost:{}/login".format(self.WEB_SERVER_PORT),
+        r = yield self.treq.get(
+            u"http://{}/login".format(self.WEB_NAME),
             )
         cookies = r.cookies()
         self.assertEqual(r.code, 200)
         pa_url = r.request.absoluteURI.decode("ascii")
         # ensure we were redirected to the auth server
-        self.assertNotIn(six.text_type(self.WEB_SERVER_PORT), pa_url)
-        self.assertIn(six.text_type(self.AUTH_SERVER_PORT), pa_url)
+        self.assertNotIn(six.text_type(self.WEB_NAME), pa_url)
+        self.assertIn(six.text_type(self.AUTH_NAME), pa_url)
         # ensure paramters were set correctly
         self.assertIn(u"action=login", pa_url)
         self.assertIn(u"ctoken=", pa_url)
         
         # POST correct login userdata
-        r = yield treq.post(
+        r = yield self.treq.post(
             pa_url,
             params={
                 u"username": self.USER_A_NAME,
@@ -300,37 +289,37 @@ class CsauthTests(unittest.TestCase):
         self.assertEqual(r.code, 200)
         url = r.request.absoluteURI.decode("ascii")
         # ensure we were redirected back to webserver
-        self.assertNotIn(six.text_type(self.AUTH_SERVER_PORT), url)
-        self.assertIn(six.text_type(self.WEB_SERVER_PORT), url)
+        self.assertNotIn(six.text_type(self.AUTH_NAME), url)
+        self.assertIn(six.text_type(self.WEB_NAME), url)
         
         # ensure content was set correctly
         text = yield r.text()
         self.assertEqual(text, self.USER_A_NAME)
         
         # ensure cookies will keep us logged in
-        cr = yield treq.get(
-            u"http://localhost:{}/login".format(self.WEB_SERVER_PORT),
+        cr = yield self.treq.get(
+            u"http://{}/login".format(self.WEB_NAME),
             cookies=cookies,
-            )
+        )
         url = cr.request.absoluteURI.decode("ascii")
-        self.assertNotIn(six.text_type(self.AUTH_SERVER_PORT), url)
-        self.assertIn(six.text_type(self.WEB_SERVER_PORT), url)
+        self.assertNotIn(six.text_type(self.AUTH_NAME), url)
+        self.assertIn(six.text_type(self.WEB_NAME), url)
         
         # expire session
-        er = yield treq.get(
-            u"http://localhost:{}/expire".format(self.AUTH_SERVER_PORT),
+        er = yield self.treq.get(
+            u"http://{}/expire".format(self.AUTH_NAME),
             cookies=cookies,
             )
         self.assertEqual(er.code, 200)
         
         # ensure we will no longer be logged in automatically
-        cr = yield treq.get(
-            u"http://localhost:{}/login".format(self.WEB_SERVER_PORT),
+        cr = yield self.treq.get(
+            u"http://{}/login".format(self.WEB_NAME),
             cookies=cookies,
             )
         url = cr.request.absoluteURI.decode("ascii")
-        self.assertNotIn(six.text_type(self.WEB_SERVER_PORT), url)
-        self.assertIn(six.text_type(self.AUTH_SERVER_PORT), url)
+        self.assertNotIn(six.text_type(self.WEB_NAME), url)
+        self.assertIn(six.text_type(self.AUTH_NAME), url)
     
     @defer.inlineCallbacks
     def test_login_different_perm_correct(self):
@@ -338,15 +327,15 @@ class CsauthTests(unittest.TestCase):
         Test a correct login with site b, which has different permissions.
         """
         # first, GET loginpage
-        r = yield treq.get(
-            u"http://localhost:{}/bpage".format(self.WEB_SERVER_PORT),
+        r = yield self.treq.get(
+            u"http://{}/bpage".format(self.WEB_NAME),
             )
         cookies = r.cookies()
         self.assertEqual(r.code, 200)
         pa_url = r.request.absoluteURI.decode("ascii")
         # ensure we were redirected to the auth server
-        self.assertNotIn(six.text_type(self.WEB_SERVER_PORT), pa_url)
-        self.assertIn(six.text_type(self.AUTH_SERVER_PORT), pa_url)
+        self.assertNotIn(six.text_type(self.WEB_NAME), pa_url)
+        self.assertIn(six.text_type(self.AUTH_NAME), pa_url)
         # ensure paramters were set correctly
         self.assertIn(u"action=login", pa_url)
         self.assertIn(u"ctoken=", pa_url)
@@ -354,7 +343,7 @@ class CsauthTests(unittest.TestCase):
         # POST correct login userdata
         # we use user b this time, so we also check whether different
         # users work
-        r = yield treq.post(
+        r = yield self.treq.post(
             pa_url,
             params={
                 u"username": self.USER_B_NAME,
@@ -366,8 +355,8 @@ class CsauthTests(unittest.TestCase):
         self.assertEqual(r.code, 200)
         url = r.request.absoluteURI.decode("ascii")
         # ensure we were redirected back to webserver
-        self.assertNotIn(six.text_type(self.AUTH_SERVER_PORT), url)
-        self.assertIn(six.text_type(self.WEB_SERVER_PORT), url)
+        self.assertNotIn(six.text_type(self.AUTH_NAME), url)
+        self.assertIn(six.text_type(self.WEB_NAME), url)
         # ensure we are at the bpade
         self.assertIn(u"bpage", url)
         
@@ -376,13 +365,13 @@ class CsauthTests(unittest.TestCase):
         self.assertEqual(text, six.text_type(len(self.USER_B_NAME)))
         
         # ensure cookies will keep us logged in
-        cr = yield treq.get(
-            u"http://localhost:{}/bpage".format(self.WEB_SERVER_PORT),
+        cr = yield self.treq.get(
+            u"http://{}/bpage".format(self.WEB_NAME),
             cookies=cookies,
             )
         url = cr.request.absoluteURI.decode("ascii")
-        self.assertNotIn(six.text_type(self.AUTH_SERVER_PORT), url)
-        self.assertIn(six.text_type(self.WEB_SERVER_PORT), url)
+        self.assertNotIn(six.text_type(self.AUTH_NAME), url)
+        self.assertIn(six.text_type(self.WEB_NAME), url)
         self.assertIn(u"bpage", url)
     
     @defer.inlineCallbacks
@@ -391,22 +380,22 @@ class CsauthTests(unittest.TestCase):
         Test that cookies will kept you logged in across sites.
         """
         # first, GET loginpage
-        r = yield treq.get(
-            u"http://localhost:{}/login".format(self.WEB_SERVER_PORT),
+        r = yield self.treq.get(
+            u"http://{}/login".format(self.WEB_NAME),
             )
         cookies = r.cookies()
         self.assertEqual(r.code, 200)
         pa_url = r.request.absoluteURI.decode("ascii")
         # ensure we were redirected to the auth server
-        self.assertNotIn(six.text_type(self.WEB_SERVER_PORT), pa_url)
-        self.assertIn(six.text_type(self.AUTH_SERVER_PORT), pa_url)
+        self.assertNotIn(six.text_type(self.WEB_NAME), pa_url)
+        self.assertIn(six.text_type(self.AUTH_NAME), pa_url)
         self.assertIn(u"login", pa_url)
         # ensure paramters were set correctly
         self.assertIn(u"action=login", pa_url)
         self.assertIn(u"ctoken=", pa_url)
         
         # POST correct login userdata
-        r = yield treq.post(
+        r = yield self.treq.post(
             pa_url,
             params={
                 u"username": self.USER_A_NAME,
@@ -418,23 +407,23 @@ class CsauthTests(unittest.TestCase):
         self.assertEqual(r.code, 200)
         url = r.request.absoluteURI.decode("ascii")
         # ensure we were redirected back to webserver
-        self.assertNotIn(six.text_type(self.AUTH_SERVER_PORT), url)
-        self.assertIn(six.text_type(self.WEB_SERVER_PORT), url)
+        self.assertNotIn(six.text_type(self.AUTH_NAME), url)
+        self.assertIn(six.text_type(self.WEB_NAME), url)
         
         # ensure content was set correctly
         text = yield r.text()
         self.assertEqual(text, self.USER_A_NAME)
         
         # GET bpage
-        r = yield treq.get(
-            u"http://localhost:{}/bpage".format(self.WEB_SERVER_PORT),
+        r = yield self.treq.get(
+            u"http://{}/bpage".format(self.WEB_NAME),
             cookies=cookies,
             )
         self.assertEqual(r.code, 200)
         url = r.request.absoluteURI.decode("ascii")
         # ensure we were not redirected to the auth server
-        self.assertIn(six.text_type(self.WEB_SERVER_PORT), url)
-        self.assertNotIn(six.text_type(self.AUTH_SERVER_PORT), url)
+        self.assertIn(six.text_type(self.WEB_NAME), url)
+        self.assertNotIn(six.text_type(self.AUTH_NAME), url)
         self.assertIn(u"bpage", url)
         # ensure content is still correct
         # this is important, since the different sites have different
@@ -448,21 +437,21 @@ class CsauthTests(unittest.TestCase):
         Test an invalid login.
         """
         # first, GET loginpage
-        r = yield treq.get(
-            u"http://localhost:{}/login".format(self.WEB_SERVER_PORT),
+        r = yield self.treq.get(
+            u"http://{}/login".format(self.WEB_NAME),
             )
         cookies = r.cookies()
         self.assertEqual(r.code, 200)
         pa_url = r.request.absoluteURI.decode("ascii")
         # ensure we were redirected to the auth server
-        self.assertNotIn(six.text_type(self.WEB_SERVER_PORT), pa_url)
-        self.assertIn(six.text_type(self.AUTH_SERVER_PORT), pa_url)
+        self.assertNotIn(six.text_type(self.WEB_NAME), pa_url)
+        self.assertIn(six.text_type(self.AUTH_NAME), pa_url)
         # ensure paramters were set correctly
         self.assertIn(u"action=login", pa_url)
         self.assertIn(u"ctoken=", pa_url)
         
         # POST incorrect login userdata
-        r = yield treq.post(
+        r = yield self.treq.post(
             pa_url,
             params={
                 u"username": self.USER_A_NAME,
@@ -474,15 +463,15 @@ class CsauthTests(unittest.TestCase):
         self.assertEqual(r.code, 401)
         url = r.request.absoluteURI.decode("ascii")
         # ensure we were not redirected back to webserver
-        self.assertIn(six.text_type(self.AUTH_SERVER_PORT), url)
-        self.assertNotIn(six.text_type(self.WEB_SERVER_PORT), url)
+        self.assertIn(six.text_type(self.AUTH_NAME), url)
+        self.assertNotIn(six.text_type(self.WEB_NAME), url)
         
         # ensure a malicious request back to the webserver will fail
         qs = urlparse(url).query
         ctoken = parse_qs(qs)[u"ctoken"]
-        r = yield treq.get(
-            u"http://localhost:{}/login?action=callback&ctoken={}".format(
-                self.WEB_SERVER_PORT,
+        r = yield self.treq.get(
+            u"http://{}/login?action=callback&ctoken={}".format(
+                self.WEB_NAME,
                 ctoken,
                 ),
             cookies=cookies,
@@ -491,8 +480,8 @@ class CsauthTests(unittest.TestCase):
         self.assertEqual(r.code, 200)
         pa_url = r.request.absoluteURI.decode("ascii")
         # ensure we were redirected to the auth server
-        self.assertNotIn(six.text_type(self.WEB_SERVER_PORT), pa_url)
-        self.assertIn(six.text_type(self.AUTH_SERVER_PORT), pa_url)
+        self.assertNotIn(six.text_type(self.WEB_NAME), pa_url)
+        self.assertIn(six.text_type(self.AUTH_NAME), pa_url)
     
     @defer.inlineCallbacks
     def test_token_secret_invalid(self):
@@ -500,12 +489,12 @@ class CsauthTests(unittest.TestCase):
         Test an invalid token/secret.
         """
         # first, GET loginpage
-        r = yield treq.get(
-            u"http://localhost:{}/invalid".format(self.WEB_SERVER_PORT),
+        r = yield self.treq.get(
+            u"http://{}/invalid".format(self.WEB_NAME),
             )
         cookies = r.cookies()
         self.assertEqual(r.code, 500)
         pa_url = r.request.absoluteURI.decode("ascii")
         # ensure we were not redirected to the auth server
-        self.assertIn(six.text_type(self.WEB_SERVER_PORT), pa_url)
-        self.assertNotIn(six.text_type(self.AUTH_SERVER_PORT), pa_url)
+        self.assertIn(six.text_type(self.WEB_NAME), pa_url)
+        self.assertNotIn(six.text_type(self.AUTH_NAME), pa_url)
